@@ -1,0 +1,364 @@
+apiVersion: v1
+kind: Template
+labels:
+  template: jh-icbc-vtdc-template
+  group: jh-icbc-vtdc
+metadata:
+  annotations:
+    iconClass: icon-jenkins
+    tags: instant-app,jenkins,gogs,nexus,cicd
+  name: jh-icbc-vtdc
+message: "Use the following credentials for login:\nJenkins: use your OpenShift credentials\nNexus: admin/admin123\nSonarQube: admin/admin\nGogs Git Server: gogs/gogs"
+parameters:
+- displayName: DEV project name
+  value: jik2hd-dev
+  name: DEV_PROJECT
+  required: true
+- displayName: TEST project name
+  value: jik2hd-test
+  name: TEST_PROJECT
+  required: true
+- displayName: Deploy Eclipse Che
+  description: Deploy Eclipse Che in order to use as an online IDE for changing code in this demo
+  value: "false"
+  name: DEPLOY_CHE
+  required: true
+- displayName: Ephemeral
+  description: Use no persistent storage for Gogs and Nexus
+  value: "false"
+  name: EPHEMERAL
+  required: true
+- description: Webhook secret
+  from: '[a-zA-Z0-9]{8}'
+  generate: expression
+  name: WEBHOOK_SECRET
+  required: true
+- displayName: Integrate Quay.io
+  description: Integrate image build and deployment with Quay.io 
+  value: "false"
+  name: ENABLE_QUAY
+  required: true
+- displayName: Quay.io Username
+  description: Quay.io username to push the images to jhicbcvtdc-sample-app repository on your Quay.io account
+  name: QUAY_USERNAME
+- displayName: Quay.io Password
+  description: Quay.io password to push the images to jhicbcvtdc-sample-app repository on your Quay.io account
+  name: QUAY_PASSWORD
+- displayName: Quay.io Image Repository
+  description: Quay.io repository for pushing jhicbcvtdc container images
+  name: QUAY_REPOSITORY
+  required: true
+  value: jhicbcvtdc-app
+objects:
+# - apiVersion: v1
+#   groupNames: null
+#   kind: RoleBinding
+#   metadata:
+#     name: default_admin
+#   roleRef:
+#     name: admin
+#   subjects:
+#   - kind: ServiceAccount
+#     name: default
+# Pipeline
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      pipeline.alpha.openshift.io/uses: '[{"name": "jenkins", "namespace": "", "kind": "DeploymentConfig"}]'
+    labels:
+      app: jh-icbc-vtdc-pipeline
+      name: jh-icbc-vtdc-pipeline
+    name: jh-icbc-vtdc-pipeline
+  spec:
+    triggers:
+      - type: GitHub
+        github:
+          secret: ${WEBHOOK_SECRET}
+      - type: Generic
+        generic:
+          secret: ${WEBHOOK_SECRET}
+    runPolicy: Serial
+    source:
+      type: None
+    strategy:
+      jenkinsPipelineStrategy:
+        env:
+        - name: DEV_PROJECT
+          value: ${DEV_PROJECT}
+        - name: TEST_PROJECT
+          value: ${TEST_PROJECT}
+        - name: ENABLE_QUAY
+          value: ${ENABLE_QUAY}
+        jenkinsfile: |-
+          def mvnCmd = "mvn -s configuration/cicd-settings-nexus3.xml"
+
+          pipeline {
+            agent {
+              label 'maven'
+            }
+            stages {
+              stage('Build JH Common') {
+                steps {
+                  git branch: 'pipeline-enabled', url: 'https://github.com/rsivphdev/poccommon.git'
+                  sh "${mvnCmd} install -DskipTests=true"
+                }
+              }
+              stage('Archive Common App') {
+                steps {
+                  sh "${mvnCmd} deploy -DskipTests=true -P nexus3"
+                }
+              }
+              stage('Build JH App') {
+                steps {
+                  git branch: 'pipeline-enabled', url: 'https://github.com/rsivphdev/pocicbcvtdc.git'
+                  sh "${mvnCmd} install -DskipTests=true"
+                }
+              }
+              stage('Test') {
+                steps {
+                  sh "${mvnCmd} test"
+                  //step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+                }
+              }
+              stage('Code Analysis') {
+                steps {
+                  script {
+                    sh "${mvnCmd} sonar:sonar -Dsonar.host.url=http://sonar:9000 -DskipTests=true"
+                  }
+                }
+              }
+              stage('Archive App') {
+                steps {
+                  sh "${mvnCmd} deploy -DskipTests=true -P nexus3"
+                }
+              }
+              stage('Build Image') {
+                steps {
+                  //sh "cp target/vtdc.war target/ROOT.war"
+                  script {
+                    openshift.withCluster() {
+                      openshift.withProject(env.DEV_PROJECT) {
+                        openshift.selector("bc", "jhicbcvtdc").startBuild("--from-file=target/vtdc.war", "--wait=true")
+                      }
+                    }
+                  }
+                }
+              }
+              stage('Deploy DEV') {
+                steps {
+                  script {
+                    openshift.withCluster() {
+                      openshift.withProject(env.DEV_PROJECT) {
+                        openshift.selector("dc", "jhicbcvtdc").rollout().latest();
+                      }
+                    }
+                  }
+                }
+              }
+              stage('Promote to TEST?') {
+                agent {
+                  label 'skopeo'
+                }
+                steps {
+                  timeout(time:15, unit:'MINUTES') {
+                      input message: "Promote to TEST?", ok: "Promote"
+                  }
+
+                  script {
+                    openshift.withCluster() {
+                      if (env.ENABLE_QUAY.toBoolean()) {
+                        withCredentials([usernamePassword(credentialsId: "${openshift.project()}-quay-cicd-secret", usernameVariable: "QUAY_USER", passwordVariable: "QUAY_PWD")]) {
+                          sh "skopeo copy docker://quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:latest docker://quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:stage --src-creds \"$QUAY_USER:$QUAY_PWD\" --dest-creds \"$QUAY_USER:$QUAY_PWD\" --src-tls-verify=false --dest-tls-verify=false"
+                        }
+                      } else {
+                        openshift.tag("${env.DEV_PROJECT}/jhicbcvtdc:latest", "${env.TEST_PROJECT}/jhicbcvtdc:stage")
+                      }
+                    }
+                  }
+                }
+              }
+              stage('Deploy TEST') {
+                steps {
+                  script {
+                    openshift.withCluster() {
+                      openshift.withProject(env.TEST_PROJECT) {
+                        openshift.selector("dc", "jhicbcvtdc").rollout().latest();
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+      type: JenkinsPipeline
+
+# apiVersion: v1
+#   kind: ConfigMap
+#   metadata:
+#     name: jhicbcvtdc-config
+#     namespace: jik2hd-dev
+#   data:
+#     module.xml: |-
+#       <?xml version="1.0" encoding="UTF-8"?>
+#       <module xmlns="urn:jboss:module:1.1" name="pssg.poc.icbc">
+#       <resources>
+#       <resource-root path="."/>
+#       </resources>
+#       </module>
+#     vphsc.properties: |-
+#       --Common section
+#       version=1.0.0
+#       dev.greeting=Welcome to Support Console DEV
+#       dev.pssgvphAPI.URI=http://pocvphvtd-rsifc-4363:8080/vphvtd/
+#       dev.pssgvphAPI.UserName=
+#       dev.pssgvphAPI.Password=
+ 
+#       --Test
+#       test.greeting=Welcome to Support Console TEST
+#       test.pssgvphAPI.URI=http://pocvphvtd-rsifc-4363:8080/vphvtd/
+#       test.pssgvphAPI.UserName=
+#       test.pssgvphAPI.Password=
+  
+#       --PROD
+#       prod.greeting=Welcome to Support Console PROD
+#       prod.pssgvphAPI.URI=http://pocvphvtd-rsifc-4363:8080/vphvtd/
+#       prod.pssgvphAPI.UserName=
+#       prod.pssgvphAPI.Password=
+    
+# Setup Demo
+
+- apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: jh-icbc-vtdc-installer-job
+  spec:
+    activeDeadlineSeconds: 400
+    completions: 1
+    parallelism: 1
+    template:
+      spec:
+        containers:
+        - env:
+          - name: CICD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          command:
+          - /bin/bash
+          - -x
+          - -c
+          - |           
+            # adjust jenkins 
+            # oc set resources dc/jenkins --limits=cpu=2,memory=2Gi --requests=cpu=100m,memory=512Mi 
+            # oc label dc jenkins app=jenkins --overwrite 
+
+            # setup dev env
+            oc import-image wildfly --from=openshift/wildfly-120-centos7 --confirm -n ${DEV_PROJECT} 
+            
+            # dev
+            oc new-build --name=jhicbcvtdc --image-stream=wildfly:latest --binary=true -n ${DEV_PROJECT}
+            oc new-app jhicbcvtdc:latest --allow-missing-images -n ${DEV_PROJECT}
+            oc set triggers dc -l app=jhicbcvtdc --containers=jhicbcvtdc --from-image=jhicbcvtdc:latest --manual -n ${DEV_PROJECT}
+            
+            # stage
+            oc new-app jhicbcvtdc:stage --allow-missing-images -n ${TEST_PROJECT}
+            oc set triggers dc -l app=jhicbcvtdc --containers=jhicbcvtdc --from-image=jhicbcvtdc:stage --manual -n ${TEST_PROJECT}
+            
+            # dev project
+            oc expose dc/jhicbcvtdc --port=8080 -n ${DEV_PROJECT}
+            oc expose svc/jhicbcvtdc --path="/vtdc" -n ${DEV_PROJECT}
+            #oc set volume dc/jhicbcvtdc --overwrite --add -t configmap  -m /wildfly/provided_modules/pssg/poc/icbc/main --name=jhicbcvtdc-mnt --configmap-name=jhicbcvtdc-config
+            #
+            # oc set probe dc/jhicbcvtdc --readiness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=30 --failure-threshold=10 --period-seconds=10 -n ${DEV_PROJECT}
+            # oc set probe dc/jhicbcvtdc --liveness  --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=180 --failure-threshold=10 --period-seconds=10 -n ${DEV_PROJECT}
+            #
+            # ddk doesnt work in build pod
+            # oc create configmap jhicbcvtdc-config -n ${DEV_PROJECT} --from-file=pocicbcvtdc/modules/pssg/poc/icbc/main/module.xml --from-file=pocicbcvtdc/modules/pssg/poc/icbc/main/vphsc.properties
+            # oc set volume dc/jhicbcvtdc --overwrite --add -t configmap  -m /wildfly/provided_modules/pssg/poc/icbc/main --name=jhicbcvtdc-config --configmap-name=jhicbcvtdc-config
+            oc rollout cancel dc/jhicbcvtdc -n ${DEV_PROJECT}
+
+            # stage project
+            oc expose dc/jhicbcvtdc --port=8080 -n ${TEST_PROJECT}
+            oc expose svc/jhicbcvtdc --path="/vtdc" -n ${TEST_PROJECT}
+            # oc set probe dc/jhicbcvtdc --readiness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=30 --failure-threshold=10 --period-seconds=10 -n ${TEST_PROJECT}
+            # oc set probe dc/jhicbcvtdc --liveness  --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=180 --failure-threshold=10 --period-seconds=10 -n ${TEST_PROJECT}
+            #
+            # ddk doesnt work in build pod
+            # oc create configmap jhicbcvtdc-config -n ${TEST_PROJECT} --from-file=pocicbcvtdc/modules/pssg/poc/icbc/main/module.xml --from-file=pocicbcvtdc/modules/pssg/poc/icbc/main/vphsc.properties
+            # oc set volume dc/jhicbcvtdc -n ${TEST_PROJECT} --overwrite --add -t configmap  -m /wildfly/provided_modules/pssg/poc/icbc/main --name=jhicbcvtdc-config --configmap-name=jhicbcvtdc-config
+            oc rollout cancel dc/jhicbcvtdc -n ${TEST_PROJECT}
+
+            GOGS_SVC=$(oc get svc gogs -o template --template='{{.spec.clusterIP}}')
+            GOGS_USER=gogs
+            GOGS_PWD=gogs
+
+            # Get POC Common libs into GOGS.
+            cat <<EOF > /tmp/data.json
+            {
+              "clone_addr": "https://github.com/rsivphdev/poccommon.git",
+              "uid": 1,
+              "repo_name": "poccommon"
+            }
+            EOF
+
+            _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
+            -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/migrate -d @/tmp/data.json)
+
+            if [ $_RETURN != "201" ] ;then
+              echo "ERROR: Failed to import pocicbcvtdc GitHub repo"
+              cat /tmp/curl.log
+              exit 255
+            fi
+
+            sleep 5
+
+
+            cat <<EOF > /tmp/data.json
+            {
+              "clone_addr": "https://github.com/rsivphdev/pocicbcvtdc.git",
+              "uid": 1,
+              "repo_name": "jh-icbc-vtdc"
+            }
+            EOF
+
+            _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
+            -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/migrate -d @/tmp/data.json)
+
+            if [ $_RETURN != "201" ] ;then
+              echo "ERROR: Failed to import pocicbcvtdc GitHub repo"
+              cat /tmp/curl.log
+              exit 255
+            fi
+
+            sleep 5
+
+            cat <<EOF > /tmp/data.json
+            {
+              "type": "gogs",
+              "config": {
+                "url": "https://openshift.default.svc.cluster.local/oapi/v1/namespaces/$CICD_NAMESPACE/buildconfigs/jh-icbc-vtdc-pipeline/webhooks/${WEBHOOK_SECRET}/generic",
+                "content_type": "json"
+              },
+              "events": [
+                "push"
+              ],
+              "active": true
+            }
+            EOF
+
+            # POC git doesn't have webhooks yet.
+            # _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
+            # -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/gogs/pocicbcvtdc/hooks -d @/tmp/data.json)
+
+            # if [ $_RETURN != "201" ] ; then
+            #   echo "ERROR: Failed to set webhook"
+            #   cat /tmp/curl.log
+            #   exit 255
+            # fi
+          image: openshift/origin:v3.11
+          name: jh-icbc-vtdc-installer-job
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        restartPolicy: Never
