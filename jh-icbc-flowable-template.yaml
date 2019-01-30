@@ -1,0 +1,63 @@
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  annotations:
+    pipeline.alpha.openshift.io/uses: '[{"name": "jenkins", "namespace": "", "kind": "DeploymentConfig"}]'
+  creationTimestamp: '2019-01-24T23:35:50Z'
+  labels:
+    app: jh-icbc-vtdc-flowable
+    group: jh-icbc-vtdc
+    name: jh-icbc-vtdc-flowable
+    template: jh-icbc-vtdc-flowable
+  name: jh-icbc-vtdc-flowable
+  namespace: leoflowable
+  resourceVersion: '2465784'
+  selfLink: >-
+    /apis/build.openshift.io/v1/namespaces/leoflowable/buildconfigs/jh-icbc-vtdc-flowable
+  uid: c8a26461-2030-11e9-bba8-000c29ac60b7
+spec:
+  failedBuildsHistoryLimit: 5
+  nodeSelector: {}
+  output: {}
+  postCommit: {}
+  resources: {}
+  runPolicy: Serial
+  source:
+    type: None
+  strategy:
+    jenkinsPipelineStrategy:
+      env:
+        - name: DEV_PROJECT
+          value: flowableadmin
+      jenkinsfile: |-
+        pipeline {
+          agent {
+              label 'maven'
+            }
+          stages {
+            stage('Checkout from GitHub') {
+              steps {
+                git branch: 'master', url: 'https://github.com/rsivphdev/flowable.git'
+              }
+            }
+            stage('Re-build wars') {
+              steps {
+                sh "cd admin && jar -uvf0 flowable-admin.war WEB-INF"
+                sh "cd idm && jar -uvf0 flowable-idm.war WEB-INF"
+                sh "mv ./admin/flowable-admin.war ./admin/flowable-admin.jar"
+                sh "mv ./idm/flowable-idm.war ./idm/flowable-idm.jar"
+              }
+            }
+            stage('Start Builds') {
+              steps {
+                sh "oc start-build flowabletestadmin --from-file=./admin/flowable-admin.jar --follow;"
+                sh "oc start-build flowabletestidm --from-file=./idm/flowable-idm.jar --follow;"
+              }
+            }
+          }
+        }
+    type: JenkinsPipeline
+  successfulBuildsHistoryLimit: 5
+  triggers: []
+status:
+  lastVersion: 22
