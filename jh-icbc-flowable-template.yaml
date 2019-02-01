@@ -31,9 +31,7 @@ spec:
           value: flowableadmin
       jenkinsfile: |-
         pipeline {
-          agent {
-              label 'maven'
-            }
+          agent any
           stages {
             stage('Checkout from GitHub') {
               steps {
