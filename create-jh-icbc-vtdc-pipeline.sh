@@ -1,5 +1,6 @@
 #!/bin/bash
-git clone https://github.com/rsivphdev/pocicbcvtdc.git
+#git clone https://github.com/rsivphdev/pocicbcvtdc.git
+git clone --single-branch --branch pipeline-enabled https://github.com/rsivphdev/pocicbcvtdc.git
 sleep 3
 oc login -u cluster-admin
 oc new-app -n jik2hd-tools -f jh-icbc-vtdc-template.yaml
