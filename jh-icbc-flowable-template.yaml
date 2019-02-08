@@ -42,14 +42,17 @@ spec:
               steps {
                 sh "cd admin && jar -uvf0 flowable-admin.war WEB-INF"
                 sh "cd idm && jar -uvf0 flowable-idm.war WEB-INF"
+                sh "cd modeler && jar -uvf0 flowable-modeler.war WEB-INF"
                 sh "mv ./admin/flowable-admin.war ./admin/flowable-admin.jar"
                 sh "mv ./idm/flowable-idm.war ./idm/flowable-idm.jar"
+                sh "mv ./modeler/flowable-modeler.war ./modeler/flowable-modeler.jar"
               }
             }
             stage('Start Builds') {
               steps {
-                sh "oc start-build flowabletestadmin --from-file=./admin/flowable-admin.jar --follow;"
                 sh "oc start-build flowabletestidm --from-file=./idm/flowable-idm.jar --follow;"
+                sh "oc start-build flowabletestadmin --from-file=./admin/flowable-admin.jar --follow;"
+                sh "oc start-build flowabletestmodeler --from-file=./modeler/flowable-modeler.jar --follow;"
               }
             }
           }
